@@ -1,0 +1,195 @@
+#!/bin/bash -e
+
+OC_VERSION=`oc version || true`
+if [ -z "$OC_VERSION" ]; then
+    echo "Please make sure the oc binary is in the PATH"
+    exit 1
+fi
+
+DIR=`dirname $?`
+DIR=`readlink -f $DIR`
+
+source $DIR/config
+
+OC_CONFIG=$DIR/openshift-basedir
+
+if [ -z "$TAG" ]; then
+    OC_TAG=""
+else
+    OC_TAG="--tag=$TAG"
+fi
+
+echo "Starting Keycloak External Container"
+# We start Keycloak directly with docker to simulate an external pre-existing
+# keycloak install. This makes bootstrap a lot easier and less flakey
+KCID=`docker run -d \
+        -e KEYCLOAK_USER=admin \
+        -e KEYCLOAK_PASSWORD=admin \
+        -e DB_VENDOR=H2 \
+        -e PROXY_ADDRESS_FORWARDING=true \
+        -e KEYCLOAK_LOGLEVEL=DEBUG \
+        --name external_keycloak \
+        jboss/keycloak-openshift:nightly-openshift-integration`
+
+# Wait a little while to let it start
+sleep 10
+
+docker exec $KCID ./keycloak/bin/kcadm.sh config credentials \
+    --config /tmp/.kcadm.config \
+    --server http://localhost:8080/auth --realm master \
+    --user admin --password admin
+echo "Creating Keycloak OAuth Clients"
+# web console
+docker exec $KCID ./keycloak/bin/kcadm.sh create clients \
+    --config /tmp/.kcadm.config -r master \
+    -s clientId=openshift-web-console \
+    -s enabled=true \
+    -s publicClient=true \
+    -s "redirectUris=[\"https://$OC_PUBLIC_IP:8443/console/*\",\"https://localhost:9000/*\"]" \
+    -s baseUrl=https://$OC_PUBLIC_IP:8443/ \
+    -s adminUrl=https://$OC_PUBLIC_IP:8443/
+# cli login
+docker exec $KCID ./keycloak/bin/kcadm.sh create clients \
+    --config /tmp/.kcadm.config -r master \
+    -s clientId=openshift-challenging-client \
+    -s enabled=true \
+    -s publicClient=true \
+    -s "redirectUris=[\"https://$OC_PUBLIC_IP:8443/oauth/token/implicit\"]" \
+    -s baseUrl=https://$OC_PUBLIC_IP:8443/ \
+    -s adminUrl=https://$OC_PUBLIC_IP:8443/
+# browser client
+docker exec $KCID ./keycloak/bin/kcadm.sh create clients \
+    --config /tmp/.kcadm.config -r master \
+    -s clientId=openshift-browser-client \
+    -s enabled=true \
+    -s publicClient=true \
+    -s "redirectUris=[\"https://$OC_PUBLIC_IP:8443/oauth/token/display\"]" \
+    -s baseUrl=https://$OC_PUBLIC_IP:8443/ \
+    -s adminUrl=https://$OC_PUBLIC_IP:8443/
+echo "Setting token expiration to 1d"
+docker exec $KCID ./keycloak/bin/kcadm.sh update realms/master \
+    --config /tmp/.kcadm.config -r master \
+    -s accessTokenLifespanForImplicitFlow=86400 \
+    -s accessTokenLifespan=86400
+
+KC_IP=`docker inspect --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $KCID`
+KEYCLOAK_WEBHOOK_URL=http://$KC_IP:8080/auth
+KEYCLOAK_METADATA_URL=$KEYCLOAK_URL
+
+# We need to proceed with a two phase install atm.
+# oc cluster up insists on trying to log in a user to complete the install
+# phase, so we need to start once with the embedded oauth server and let it
+# successfully log in. Then we disable our oauth server, and configure the
+# whole thing.
+
+oc cluster up --base-dir=$OC_CONFIG --public-hostname $OC_PUBLIC_IP --server-loglevel=$OC_SERVER_LOG_LEVEL $OC_TAG
+
+echo "Swap internal Oauth Server for Keycloak"
+oc cluster down
+
+for i in kube-apiserver openshift-apiserver openshift-controller-manager; do
+    cp webhook.yaml $OC_CONFIG/$i
+    sed -i "s|KEYCLOAK_URL|$KEYCLOAK_WEBHOOK_URL|" $OC_CONFIG/$i/webhook.yaml
+    cp metadata.json $OC_CONFIG/$i
+    sed -i "s|KEYCLOAK_URL|$KEYCLOAK_METADATA_URL|" $OC_CONFIG/$i/metadata.json
+done
+
+sed -i 's|"webhookTokenAuthenticators":null|"webhookTokenAuthenticators":[{"configFile": "webhook.yaml"}]|' $OC_CONFIG/kube-apiserver/master-config.yaml
+
+for i in openshift-apiserver openshift-controller-manager; do
+    sed -i 's|webhookTokenAuthenticators: null|webhookTokenAuthenticators:\n  - configFile: "webhook.yaml"|' $OC_CONFIG/$i/master-config.yaml
+done
+
+sed -i 's|"oauthMetadataFile":""|"oauthMetadataFile":"metadata.json"|' $OC_CONFIG/kube-apiserver/master-config.yaml
+sed -i 's|"oauthConfig":.*,"dnsConfig"|"oauthConfig":null,"dnsConfig"|' $OC_CONFIG/kube-apiserver/master-config.yaml
+for i in openshift-apiserver openshift-controller-manager; do
+    sed -i 's|oauthMetadataFile: ""|oauthMetadataFile: "metadata.json"|' $OC_CONFIG/$i/master-config.yaml
+    sed -i 's|oauthConfig:|oauthConfig: null|' $OC_CONFIG/$i/master-config.yaml
+    sed -i '/oauthConfig:/,/policyConfig:/{//!d}' $OC_CONFIG/$i/master-config.yaml
+done
+
+oc cluster up --base-dir=$OC_CONFIG --public-hostname $OC_PUBLIC_IP --server-loglevel=$OC_SERVER_LOG_LEVEL $OC_TAG
+
+oc login -u system:admin
+oc project default
+
+# Give admin access to the project as an admin
+oc policy add-role-to-user admin admin
+
+echo "Installing Keycloak Certificates"
+
+oc adm ca create-server-cert \
+    --signer-serial=$OC_CONFIG/openshift-apiserver/ca.serial.txt \
+    --signer-cert=$OC_CONFIG/openshift-apiserver/ca.crt \
+    --signer-key=$OC_CONFIG/openshift-apiserver/ca.key \
+    --hostnames=$KEYCLOAK_HOSTNAME \
+    --cert=$OC_CONFIG/keycloak.crt \
+    --key=$OC_CONFIG/keycloak.key
+
+# We need to remove the CA cert from this file for the route
+openssl x509 -in $OC_CONFIG/keycloak.crt -out $OC_CONFIG/cert-only.crt
+
+echo "Startup completed"
+
+echo "Creating Edge Route for Keycloak"
+
+# Create Service
+oc create -f - <<EOF
+    {
+        "kind": "Service",
+        "apiVersion": "v1",
+        "metadata": {
+            "name": "keycloak",
+            "annotations": {
+                "description": "Service for external Keycloak"
+            }
+        },
+        "spec": {
+            "ports": [
+                {
+                    "port": 8080,
+                    "protocol": "TCP",
+                    "targetPort": 8080
+                }
+            ]
+        }
+    }
+EOF
+
+# Create Endpoints
+oc create -f - <<EOF
+    {
+        "kind": "Endpoints",
+        "apiVersion": "v1",
+        "metadata": {
+            "name": "keycloak",
+            "annotations": {
+                "description": "Endpoints for external Keycloak"
+            }
+        },
+        "subsets": [
+            {
+                "addresses": [
+                    {
+                        "ip": "${KC_IP}"
+                    }
+                ],
+                "ports": [
+                    {
+                        "port": 8080,
+                        "protocol": "TCP"
+                    }
+                ]
+            }
+        ]
+    }
+EOF
+
+# Create Route
+oc create route edge keycloak \
+    --ca-cert=$OC_CONFIG/openshift-apiserver/ca.crt \
+    --cert=$OC_CONFIG/cert-only.crt \
+    --key=$OC_CONFIG/keycloak.key \
+    --hostname="${HOSTNAME_HTTPS}" \
+    --service="keycloak"
+

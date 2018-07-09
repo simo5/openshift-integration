@@ -1,5 +1,10 @@
 #!/bin/bash
 
 oc cluster down
+
+EKC=`docker ps -f name=external_keycloak -q`
+if [ ! -z "$EKC" ]; then
+    docker rm -f $EKC
+fi
 mount | grep openshift | awk '{ print $3}' | xargs sudo umount
 sudo rm -fr openshift-basedir
